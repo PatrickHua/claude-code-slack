@@ -17,6 +17,72 @@ The interactive Claude Code CLI solves this with background tasks, but `claude -
 
 ---
 
+## The Bus Model
+
+The manager's context window is a **shared communication bus**. The top of the bus faces humans; the bottom faces sub-agents. Everything flows through a single token stream.
+
+```
+         ┌───────────────────────────────────────────┐
+         │              HUMANS (top of bus)           │
+         │                                           │
+         │   Alice ───┐                              │
+         │   Bob ─────┤  (Slack channel / DMs)       │
+         │   Carol ───┘                              │
+         └─────────────────────┬─────────────────────┘
+                               │
+                               ▼
+         ┌─────────────────────────────────────────────┐
+         │                                             │
+         │    ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   │
+         │    ░  M A N A G E R   C O N T E X T     ░   │
+         │    ░         (the bus)                   ░   │
+         │    ░                                     ░   │
+         │    ░  Alice: "research quantum stuff"    ░   │
+         │    ░  Manager: "spawning worker #1"      ░   │
+         │    ░  [Worker #1 status: found 12 papers]░   │
+         │    ░  Bob: "also check superconductors"  ░   │
+         │    ░  [Worker #2 BLOCKED: which DB?]     ░   │
+         │    ░  Carol: "use postgres"              ░   │
+         │    ░  Manager: "relayed to worker #2"    ░   │
+         │    ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   │
+         │                                             │
+         │         MANAGER = multiplexer on the bus    │
+         │         Routes signals, never does work     │
+         └──────┬──────────┬──────────┬────────────────┘
+                │          │          │
+                ▼          ▼          ▼
+         ┌──────────┐ ┌──────────┐ ┌──────────┐
+         │Worker #1 │ │Worker #2 │ │Worker #3 │
+         │ research │ │ database │ │ code rev │
+         └──────────┘ └──────────┘ └──────────┘
+              (bottom of bus — sub-agents)
+```
+
+### Why "bus"?
+
+In computer architecture, a bus is a shared communication channel that multiple components read from and write to. The manager's context works the same way:
+
+- **Humans write to the bus** by sending Slack messages. Multiple humans in a group channel all contribute to the same stream. Alice can reference something Bob said because the manager's context holds both.
+- **Agents write to the bus** by reporting status, asking questions, and delivering results. These get injected into the manager's context at checkpoint boundaries.
+- **The manager reads the bus** and routes: human question → reply, complex task → spawn worker, worker question → relay to humans, worker result → summarize and post.
+- **`context_k` = snapshotting the bus.** When the manager spawns a worker with `context_k: 5`, it copies 5 recent entries off the bus and hands them to the new agent. The worker sees exactly what was said without the manager re-explaining.
+- **Bus bandwidth = context window.** The limiting factor is how many tokens fit. Old entries need to be compacted or archived, just like a real bus has finite bandwidth.
+
+This is closely related to the **blackboard architecture** from classical AI — a shared workspace that multiple knowledge sources (here: humans and agents) read from and write to, with a controller (the manager) deciding who acts next.
+
+### Multi-human collaboration
+
+Because the bus holds all human messages, the manager naturally handles group dynamics:
+
+- Alice asks for research → manager spawns worker
+- Bob adds a constraint → manager relays to the running worker
+- Carol asks for status → manager reads the task registry and replies
+- Worker finishes → manager posts result, all three humans see it
+
+Nobody needs to coordinate. The bus accumulates everything, and the manager synthesizes across all participants and all workers.
+
+---
+
 ## Core Idea
 
 Split the system into three layers:
