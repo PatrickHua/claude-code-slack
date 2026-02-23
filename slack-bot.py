@@ -28,14 +28,27 @@ from slack_bolt import App, Assistant
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slackify_markdown import slackify_markdown
 
-# Load .env file if it exists
-ENV_FILE = Path(__file__).parent / ".env"
+# Load env file: --env <path> or default .env
+import sys
+_env_path = None
+for i, arg in enumerate(sys.argv[1:], 1):
+    if arg == "--env" and i < len(sys.argv) - 1:
+        _env_path = Path(sys.argv[i + 1])
+        break
+    if arg.startswith("--env="):
+        _env_path = Path(arg.split("=", 1)[1])
+        break
+
+ENV_FILE = _env_path or (Path(__file__).parent / ".env")
 if ENV_FILE.exists():
     for line in ENV_FILE.read_text().splitlines():
         line = line.strip()
         if line and not line.startswith("#") and "=" in line:
             key, value = line.split("=", 1)
-            os.environ.setdefault(key.strip(), value.strip())
+            os.environ[key.strip()] = value.strip()
+else:
+    print(f"Error: env file not found: {ENV_FILE}")
+    sys.exit(1)
 
 # Silence all library DEBUG noise
 logging.basicConfig(level=logging.WARNING)
@@ -43,7 +56,7 @@ for _lg in ("slack_bolt", "slack_sdk", "slack", "markdown_it", "urllib3", "async
     logging.getLogger(_lg).setLevel(logging.WARNING)
 
 # ── Structured event log ─────────────────────────────────────────────────────
-EVENT_LOG = Path(__file__).parent / ".bot-events.jsonl"
+EVENT_LOG = Path(__file__).parent / f".bot-events-{ENV_FILE.stem}.jsonl"
 
 def emit_event(event_type: str, **kw):
     """Append a structured JSON event to the log file and print a one-liner."""
@@ -77,7 +90,8 @@ SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 SLACK_APP_TOKEN = os.environ.get("SLACK_APP_TOKEN")
 WORKSPACE = os.environ.get("CLAUDE_WORKSPACE", str(Path.home()))
 CLAUDE_PATH = os.environ.get("CLAUDE_PATH", "claude")
-SESSION_FILE = Path.home() / ".slack-claude-sessions.json"
+_agent_name = ENV_FILE.stem  # e.g. "research-agent" from envs/research-agent.env
+SESSION_FILE = Path.home() / f".slack-claude-sessions-{_agent_name}.json"
 
 # Access control - global gate (applies to all message types)
 ALLOWED_USERS = [x.strip() for x in os.environ.get("ALLOWED_USERS", "").split(",") if x.strip()]

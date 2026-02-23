@@ -15,7 +15,15 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-EVENT_LOG = Path(__file__).parent / ".bot-events.jsonl"
+def _resolve_event_log() -> Path:
+    for i, arg in enumerate(sys.argv[1:], 1):
+        if arg == "--env" and i < len(sys.argv) - 1:
+            return Path(__file__).parent / f".bot-events-{Path(sys.argv[i + 1]).stem}.jsonl"
+        if arg.startswith("--env="):
+            return Path(__file__).parent / f".bot-events-{Path(arg.split('=', 1)[1]).stem}.jsonl"
+    return Path(__file__).parent / ".bot-events-.env.jsonl"
+
+EVENT_LOG = _resolve_event_log()
 MAX_EVENTS = 40
 REFRESH_HZ = 4
 
