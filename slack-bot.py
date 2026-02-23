@@ -539,7 +539,7 @@ def run_claude(message: str, session_id: str = None) -> tuple[str, str]:
         CLAUDE_PATH, "-p", message,
         "--output-format", "json",
         "--max-turns", "10",
-        "--allowedTools", "Bash,Read,Write,WebFetch,WebSearch"
+        "--allowedTools", "Bash,Read,Write,Edit,MultiEdit,WebFetch,WebSearch,Glob,Grep,LS,TodoRead,TodoWrite"
     ]
 
     if session_id:
