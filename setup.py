@@ -7,18 +7,20 @@ Usage:
 
 The wizard will:
 1. Ask for bot name and workspace details
-2. Open a browser to api.slack.com
-3. Automate app creation from manifest
-4. Extract tokens
+2. Open api.slack.com in your default browser
+3. Walk you through app creation from manifest
+4. Ask you to paste back the tokens
 5. Write the env file
 6. Optionally launch the bot
 """
 
+import json
 import os
 import re
 import sys
 import shutil
 import subprocess
+import webbrowser
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).parent
@@ -68,8 +70,20 @@ def fail(msg):
     print(f"      {red('✗')} {msg}")
     sys.exit(1)
 
-def _copy_to_clipboard(text: str):
-    """Best-effort copy to system clipboard."""
+def pause(msg="→ Press ENTER to continue..."):
+    input(f"      {bold(msg)}")
+
+def copy_to_clipboard(text: str) -> bool:
+    """Copy text to system clipboard. Returns True on success."""
+    # macOS
+    try:
+        p = subprocess.Popen(['pbcopy'], stdin=subprocess.PIPE)
+        p.communicate(text.encode())
+        if p.returncode == 0:
+            return True
+    except FileNotFoundError:
+        pass
+    # Linux
     for cmd in (['xclip', '-selection', 'clipboard'], ['xsel', '--clipboard', '--input']):
         try:
             p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
@@ -81,39 +95,7 @@ def _copy_to_clipboard(text: str):
     return False
 
 
-# ── Pre-flight checks ───────────────────────────────────────────────────────
-
-def check_deps():
-    """Ensure Playwright and Chromium are available."""
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        fail("Playwright not installed. Run: pip install playwright")
-
-    browser_dir = Path.home() / ".cache" / "ms-playwright"
-    chromium_dirs = list(browser_dir.glob("chromium-*")) if browser_dir.exists() else []
-    if not chromium_dirs:
-        print(f"      Installing Chromium browser...")
-        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"],
-                       check=True, capture_output=True)
-
-    # Quick smoke test to see if Chromium can actually launch
-    try:
-        with sync_playwright() as pw:
-            b = pw.chromium.launch(headless=True)
-            b.close()
-        success("Playwright + Chromium ready")
-    except Exception as e:
-        if "missing dependencies" in str(e).lower():
-            print()
-            warn("System libraries missing for Chromium.")
-            print(f"      Run this command first, then re-run setup.py:")
-            print()
-            print(f"        {bold('sudo apt-get install -y libnspr4 libnss3 libasound2t64')}")
-            print()
-            sys.exit(1)
-        raise
-
+# ── Pre-flight checks ────────────────────────────────────────────────────────
 
 def check_claude():
     """Find the claude CLI binary."""
@@ -129,320 +111,142 @@ def check_claude():
     return None
 
 
-# ── Manifest generation ─────────────────────────────────────────────────────
+# ── Manifest generation ──────────────────────────────────────────────────────
 
 def generate_manifest(bot_name: str, display_name: str, description: str) -> str:
     slug = re.sub(r'[^a-z0-9-]', '-', display_name.lower()).strip('-')
-    return f"""display_information:
-  name: {bot_name}
-  description: {description}
-  background_color: "#4A154B"
+    manifest = {
+        "display_information": {
+            "name": bot_name,
+            "description": description,
+            "background_color": "#4A154B",
+        },
+        "features": {
+            "app_home": {
+                "home_tab_enabled": False,
+                "messages_tab_enabled": True,
+                "messages_tab_read_only_enabled": False,
+            },
+            "assistant_view": {
+                "assistant_description": description,
+            },
+            "bot_user": {
+                "display_name": slug,
+                "always_online": True,
+            },
+        },
+        "oauth_config": {
+            "scopes": {
+                "bot": [
+                    "app_mentions:read",
+                    "assistant:write",
+                    "channels:history",
+                    "channels:read",
+                    "chat:write",
+                    "files:read",
+                    "files:write",
+                    "groups:history",
+                    "groups:read",
+                    "groups:write",
+                    "im:history",
+                    "im:read",
+                    "im:write",
+                    "reactions:read",
+                    "reactions:write",
+                    "users:read",
+                ],
+            },
+        },
+        "settings": {
+            "event_subscriptions": {
+                "bot_events": [
+                    "app_mention",
+                    "assistant_thread_context_changed",
+                    "assistant_thread_started",
+                    "message.channels",
+                    "message.groups",
+                    "message.im",
+                ],
+            },
+            "interactivity": {"is_enabled": True},
+            "org_deploy_enabled": False,
+            "socket_mode_enabled": True,
+            "token_rotation_enabled": False,
+        },
+    }
+    return json.dumps(manifest, indent=2)
 
-features:
-  app_home:
-    home_tab_enabled: false
-    messages_tab_enabled: true
-    messages_tab_read_only_enabled: false
-  assistant_view:
-    assistant_description: {description}
-  bot_user:
-    display_name: {slug}
-    always_online: true
 
-oauth_config:
-  scopes:
-    bot:
-      - app_mentions:read
-      - assistant:write
-      - channels:history
-      - channels:read
-      - chat:write
-      - files:read
-      - files:write
-      - groups:history
-      - groups:read
-      - groups:write
-      - im:history
-      - im:read
-      - im:write
-      - reactions:read
-      - reactions:write
-      - users:read
+# ── Guided browser walkthrough ───────────────────────────────────────────────
 
-settings:
-  event_subscriptions:
-    bot_events:
-      - app_mention
-      - assistant_thread_context_changed
-      - assistant_thread_started
-      - message.channels
-      - message.groups
-      - message.im
-  interactivity:
-    is_enabled: true
-  org_deploy_enabled: false
-  socket_mode_enabled: true
-  token_rotation_enabled: false
-"""
-
-# ── Browser automation ───────────────────────────────────────────────────────
-
-def run_browser_setup(manifest_yaml: str, agent_slug: str):
-    """Open browser, create app from manifest, extract tokens."""
-    from playwright.sync_api import sync_playwright
-
+def run_browser_setup(manifest_json: str) -> dict:
+    """Walk the user through Slack app creation in their own browser."""
     tokens = {"bot_token": None, "app_token": None}
 
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=False, args=["--start-maximized"])
-        context = browser.new_context(no_viewport=True)
-        page = context.new_page()
+    # ── Step 3: Open Slack API ────────────────────────────────────────
+    step(3, "Opening Slack API in your browser...")
+    webbrowser.open("https://api.slack.com/apps")
+    wait_msg("Your browser should open to api.slack.com/apps.")
+    wait_msg("Log in if prompted, then come back here.")
+    pause("→ Press ENTER when you are on the 'Your Apps' page...")
 
-        # ── Step: Open Slack API and wait for login ──────────────────
-        step(3, "Opening Slack API in browser...")
-        page.goto("https://api.slack.com/apps")
-        wait_msg("Please log in to your Slack workspace if prompted.")
-        wait_msg("Once you see the 'Your Apps' page, press ENTER here.")
-        input(f"      {bold('→ Press ENTER when logged in...')}")
+    # ── Step 4: Create app from manifest ─────────────────────────────
+    step(4, "Create app from manifest")
+    wait_msg("In the browser:")
+    wait_msg("  1. Click  'Create New App'")
+    wait_msg("  2. Choose 'From an app manifest'")
+    wait_msg("  3. Select your workspace, then click Next")
+    pause("→ Press ENTER when you reach the manifest editor...")
 
-        # ── Step: Create New App ─────────────────────────────────────
-        step(4, "Creating app from manifest...")
+    # ── Step 5: Paste manifest ────────────────────────────────────────
+    step(5, "Paste the app manifest")
+    copied = copy_to_clipboard(manifest_json)
+    if copied:
+        success("Manifest copied to clipboard — paste it with Cmd+V / Ctrl+V")
+    else:
+        warn("Could not copy automatically. Here is the manifest to paste:")
+    print()
+    for line in manifest_json.split('\n'):
+        print(f"        {line}")
+    print()
+    if copied:
+        wait_msg("Switch to the JSON tab, clear the existing content,")
+        wait_msg("paste with Cmd+V / Ctrl+V (already in your clipboard), then click Next → Create.")
+    else:
+        wait_msg("Switch to the JSON tab, clear the existing content,")
+        wait_msg("paste the manifest above, then click Next → Create.")
+    pause("→ Press ENTER after the app has been created...")
 
-        try:
-            create_btn = page.get_by_role("link", name=re.compile(r"Create.*(New|an)?\s*App", re.I))
-            if not create_btn.is_visible(timeout=3000):
-                create_btn = page.locator("a:has-text('Create New App'), button:has-text('Create New App')").first
-            create_btn.click()
-            success("Clicked 'Create New App'")
-        except Exception:
-            warn("Couldn't find 'Create New App' button.")
-            wait_msg("Please click 'Create New App' manually.")
-            input(f"      {bold('→ Press ENTER after clicking...')}")
+    # ── Step 6: Generate App-Level Token ─────────────────────────────
+    step(6, "Generate an App-Level Token (for Socket Mode)")
+    wait_msg("On the Basic Information page:")
+    wait_msg("  1. Scroll down to 'App-Level Tokens'")
+    wait_msg("  2. Click 'Generate Token and Scopes'")
+    wait_msg("  3. Name it:  socket-mode")
+    wait_msg("  4. Add scope:  connections:write")
+    wait_msg("  5. Click Generate — you'll see a token starting with  xapp-")
+    print()
+    app_token = None
+    while not app_token or not app_token.startswith("xapp-"):
+        app_token = prompt("Paste the App-Level Token (xapp-...)").strip()
+        if not app_token.startswith("xapp-"):
+            warn("Token should start with 'xapp-', try again.")
+    tokens["app_token"] = app_token
+    success(f"App Token saved ({app_token[:20]}...)")
 
-        page.wait_for_timeout(1500)
-
-        # Select "From an app manifest"
-        try:
-            manifest_option = page.locator("text=From an app manifest").first
-            manifest_option.wait_for(state="visible", timeout=5000)
-            manifest_option.click()
-            success("Selected 'From an app manifest'")
-        except Exception:
-            warn("Couldn't find manifest option.")
-            wait_msg("Please select 'From an app manifest' manually.")
-            input(f"      {bold('→ Press ENTER after selecting...')}")
-
-        page.wait_for_timeout(2000)
-
-        # ── Step: Select workspace ───────────────────────────────────
-        step(5, "Select your workspace...")
-        wait_msg("Pick the workspace from the dropdown, then click Next.")
-        input(f"      {bold('→ Press ENTER after selecting workspace and clicking Next...')}")
-
-        page.wait_for_timeout(1500)
-
-        # ── Step: Paste manifest ─────────────────────────────────────
-        step(6, "Pasting app manifest...")
-
-        # Switch to YAML tab
-        try:
-            yaml_tab = page.locator("text=YAML").first
-            yaml_tab.wait_for(state="visible", timeout=5000)
-            yaml_tab.click()
-            page.wait_for_timeout(800)
-            success("Switched to YAML editor")
-        except Exception:
-            warn("Couldn't switch to YAML tab — may already be on it.")
-
-        # Clear and paste into the editor via clipboard (much faster than typing)
-        pasted = False
-        try:
-            editor = page.locator("textarea, .CodeMirror textarea, [role='textbox']").first
-            editor.wait_for(state="visible", timeout=5000)
-            editor.click()
-            page.keyboard.press("Control+a")
-            page.wait_for_timeout(200)
-
-            # Set clipboard via browser API, then Ctrl+V
-            page.evaluate(
-                "text => navigator.clipboard.writeText(text)",
-                manifest_yaml
-            )
-            page.keyboard.press("Control+v")
-            page.wait_for_timeout(500)
-
-            # Verify something was pasted by checking editor isn't empty
-            content = editor.input_value() if editor.evaluate("el => el.tagName") == "TEXTAREA" else ""
-            if content and len(content) > 50:
-                pasted = True
-            else:
-                # Fallback: try fill() for plain textareas
-                editor.fill(manifest_yaml)
-                pasted = True
-
-            if pasted:
-                success("Pasted manifest YAML")
-        except Exception:
-            pass
-
-        if not pasted:
-            warn("Couldn't auto-paste the manifest.")
-            _copy_to_clipboard(manifest_yaml)
-            wait_msg("The manifest has been copied to your clipboard (Ctrl+V to paste).")
-            wait_msg("If clipboard didn't work, the manifest is printed below.")
-            print()
-            for line in manifest_yaml.strip().split('\n'):
-                print(f"        {line}")
-            print()
-
-        wait_msg("Review the manifest, then click Next → Create.")
-        input(f"      {bold('→ Press ENTER after the app is created...')}")
-
-        page.wait_for_timeout(2000)
-
-        # ── Step: Generate App-Level Token ───────────────────────────
-        step(7, "Generating App-Level Token (for Socket Mode)...")
-
-        # We should now be on the Basic Information page
-        current_url = page.url
-        if "/apps/" in current_url:
-            app_id_match = re.search(r'/apps/([A-Z0-9]+)', current_url)
-            if app_id_match:
-                app_id = app_id_match.group(1)
-                success(f"App created: {app_id}")
-
-        try:
-            gen_token_btn = page.locator("text=Generate Token and Scopes").first
-            gen_token_btn.wait_for(state="visible", timeout=5000)
-            gen_token_btn.click()
-            page.wait_for_timeout(1500)
-
-            # Fill token name
-            token_name_input = page.locator("input[placeholder*='oken']").first
-            if not token_name_input.is_visible(timeout=2000):
-                token_name_input = page.locator("dialog input[type='text'], .modal input[type='text']").first
-            token_name_input.fill("socket-mode")
-            page.wait_for_timeout(500)
-
-            # Add connections:write scope
-            try:
-                scope_dropdown = page.locator("text=Add Scope").first
-                scope_dropdown.click()
-                page.wait_for_timeout(500)
-                connections_option = page.locator("text=connections:write").first
-                connections_option.click()
-                page.wait_for_timeout(500)
-            except Exception:
-                warn("Couldn't auto-select scope.")
-                wait_msg("Please add 'connections:write' scope manually.")
-
-            # Click Generate
-            try:
-                generate_btn = page.locator("button:has-text('Generate')").first
-                generate_btn.click()
-                page.wait_for_timeout(2000)
-            except Exception:
-                pass
-
-            # Try to find the generated token
-            try:
-                token_el = page.locator("text=/xapp-[a-zA-Z0-9-]+/").first
-                token_el.wait_for(state="visible", timeout=5000)
-                token_text = token_el.text_content()
-                xapp_match = re.search(r'(xapp-\S+)', token_text)
-                if xapp_match:
-                    tokens["app_token"] = xapp_match.group(1)
-                    success(f"App Token: {tokens['app_token'][:20]}...")
-            except Exception:
-                pass
-
-        except Exception:
-            warn("Couldn't auto-generate token.")
-
-        if not tokens["app_token"]:
-            wait_msg("Please generate an App-Level Token manually:")
-            wait_msg("  1. Scroll to 'App-Level Tokens' on this page")
-            wait_msg("  2. Click 'Generate Token and Scopes'")
-            wait_msg("  3. Name it 'socket-mode'")
-            wait_msg("  4. Add scope: connections:write")
-            wait_msg("  5. Click Generate and copy the xapp-... token")
-            tokens["app_token"] = prompt("Paste the App-Level Token (xapp-...)")
-
-        # ── Step: Install to Workspace & Get Bot Token ───────────────
-        step(8, "Installing app to workspace...")
-
-        try:
-            install_link = page.locator("a:has-text('Install App')").first
-            install_link.wait_for(state="visible", timeout=3000)
-            install_link.click()
-            page.wait_for_timeout(2000)
-        except Exception:
-            try:
-                page.goto(re.sub(r'/[^/]*$', '/install-on-team', page.url))
-                page.wait_for_timeout(2000)
-            except Exception:
-                pass
-
-        # Click Install to Workspace button
-        try:
-            install_btn = page.locator("button:has-text('Install to'), a:has-text('Install to')").first
-            install_btn.wait_for(state="visible", timeout=3000)
-            install_btn.click()
-            page.wait_for_timeout(3000)
-        except Exception:
-            pass
-
-        # Click Allow
-        try:
-            allow_btn = page.locator("button:has-text('Allow')").first
-            if allow_btn.is_visible(timeout=3000):
-                allow_btn.click()
-                page.wait_for_timeout(2000)
-        except Exception:
-            pass
-
-        # Try to find Bot Token
-        try:
-            token_el = page.locator("text=/xoxb-[a-zA-Z0-9-]+/").first
-            if token_el.is_visible(timeout=5000):
-                token_text = token_el.text_content()
-                xoxb_match = re.search(r'(xoxb-\S+)', token_text)
-                if xoxb_match:
-                    tokens["bot_token"] = xoxb_match.group(1)
-                    success(f"Bot Token: {tokens['bot_token'][:20]}...")
-        except Exception:
-            pass
-
-        # Navigate to OAuth page for token
-        if not tokens["bot_token"]:
-            try:
-                oauth_link = page.locator("a:has-text('OAuth')").first
-                oauth_link.click()
-                page.wait_for_timeout(2000)
-
-                token_el = page.locator("text=/xoxb-[a-zA-Z0-9-]+/").first
-                if token_el.is_visible(timeout=5000):
-                    token_text = token_el.text_content()
-                    xoxb_match = re.search(r'(xoxb-\S+)', token_text)
-                    if xoxb_match:
-                        tokens["bot_token"] = xoxb_match.group(1)
-                        success(f"Bot Token: {tokens['bot_token'][:20]}...")
-            except Exception:
-                pass
-
-        if not tokens["bot_token"]:
-            wait_msg("Please copy the Bot User OAuth Token manually:")
-            wait_msg("  Go to OAuth & Permissions → Bot User OAuth Token")
-            tokens["bot_token"] = prompt("Paste the Bot Token (xoxb-...)")
-
-        # ── Done with browser ────────────────────────────────────────
-        wait_msg("You can close the browser now (or leave it open).")
-        input(f"      {bold('→ Press ENTER to continue...')}")
-
-        try:
-            browser.close()
-        except Exception:
-            pass
+    # ── Step 7: Install app & get Bot Token ──────────────────────────
+    step(7, "Install the app to your workspace")
+    wait_msg("In the left sidebar click 'Install App',")
+    wait_msg("then click 'Install to Workspace' and Allow.")
+    wait_msg("You'll be shown the  Bot User OAuth Token  (starts with xoxb-).")
+    print()
+    bot_token = None
+    while not bot_token or not bot_token.startswith("xoxb-"):
+        bot_token = prompt("Paste the Bot User OAuth Token (xoxb-...)").strip()
+        if not bot_token.startswith("xoxb-"):
+            warn("Token should start with 'xoxb-', try again.")
+    tokens["bot_token"] = bot_token
+    success(f"Bot Token saved ({bot_token[:20]}...)")
 
     return tokens
 
@@ -474,7 +278,6 @@ def main():
     banner()
 
     step(0, "Pre-flight checks")
-    check_deps()
     claude_path = check_claude()
     if claude_path:
         success(f"Claude CLI found: {claude_path}")
@@ -494,25 +297,32 @@ def main():
             fail("Aborted.")
 
     step(2, "Generating app manifest")
-    manifest_yaml = generate_manifest(bot_name, bot_name, description)
+    manifest_json = generate_manifest(bot_name, bot_name, description)
     success("Manifest ready")
     print()
-    for line in manifest_yaml.strip().split('\n')[:8]:
+    for line in manifest_json.split('\n')[:8]:
         print(f"      {dim(line)}")
     print(f"      {dim('...')}")
     print()
 
-    tokens = run_browser_setup(manifest_yaml, agent_slug)
+    tokens = run_browser_setup(manifest_json)
 
-    if not tokens.get("bot_token") or not tokens.get("app_token"):
-        fail("Missing tokens. Please re-run setup.")
-
-    step(9, "Configuring environment")
-    channel_id = prompt("Default channel ID (right-click channel → Copy link → ID at end)", "")
+    step(8, "Configuring environment")
+    print()
+    wait_msg("Optional: set a default channel/DM the bot sends messages TO (e.g. upload results).")
+    wait_msg("The bot listens everywhere it's invited regardless — you can set this later in the .env.")
+    print()
+    channel_id = ""
+    if confirm("Set a default channel or DM now?", default=False):
+        wait_msg("In the Slack app:")
+        wait_msg("  • Channel: right-click a channel → Copy Link → last segment (C...)")
+        wait_msg("  • DM:      right-click your name  → Copy Link → starts with D...")
+        print()
+        channel_id = prompt("Channel or DM ID", "")
 
     env_path = write_env_file(agent_slug, tokens, channel_id, claude_path)
 
-    step(10, "Done!")
+    step(9, "Done!")
     print()
     print(f"  {green('Your new bot is ready!')} Configuration saved to:")
     print(f"  {bold(str(env_path))}")
