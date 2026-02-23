@@ -1,0 +1,15 @@
+[Unit]
+Description=Claude Code Slack Bot
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USERNAME
+WorkingDirectory=/path/to/claude-code-slack
+ExecStart=/usr/bin/python3 /path/to/claude-code-slack/slack-bot.py
+Restart=always
+RestartSec=10
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target
